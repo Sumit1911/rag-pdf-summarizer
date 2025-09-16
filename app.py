@@ -1,27 +1,22 @@
 import streamlit as st
 import os
-import sys
 import tempfile
 import io
+import re
 from datetime import datetime
+from typing import Optional, List
 
-# Add the current directory to Python path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Import required libraries
+import pdfplumber
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+import logging
 
-# Import utils modules
-try:
-    from utils.text_extraction import extract_text_from_pdf
-    from utils.retrieval import RAGRetriever
-    from utils.summarization import DocumentSummarizer
-except ImportError:
-    # Fallback imports for deployment
-    import utils.text_extraction as text_extraction
-    import utils.retrieval as retrieval
-    import utils.summarization as summarization
-    
-    extract_text_from_pdf = text_extraction.extract_text_from_pdf
-    RAGRetriever = retrieval.RAGRetriever
-    DocumentSummarizer = summarization.DocumentSummarizer
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Page configuration
 st.set_page_config(
@@ -66,6 +61,286 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Text extraction functions
+def clean_text(text: str) -> str:
+    """Clean extracted text by removing excessive whitespace and formatting issues."""
+    if not text:
+        return ""
+    
+    # Remove excessive whitespace and newlines
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Remove page numbers (simple patterns)
+    text = re.sub(r'\b\d+\b(?=\s*$)', '', text, flags=re.MULTILINE)
+    
+    # Remove common PDF artifacts
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\xff]', '', text)
+    
+    # Fix common spacing issues
+    text = re.sub(r'(\w)([A-Z])', r'\1 \2', text)  # Add space before capital letters
+    text = re.sub(r'([.!?])([A-Z])', r'\1 \2', text)  # Add space after punctuation
+    
+    # Remove extra spaces
+    text = ' '.join(text.split())
+    
+    return text.strip()
+
+def extract_text_from_pdf(pdf_path: str, max_pages: Optional[int] = None) -> str:
+    """Extract text from PDF file using pdfplumber."""
+    try:
+        extracted_text = ""
+        
+        with pdfplumber.open(pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            pages_to_process = min(total_pages, max_pages) if max_pages else total_pages
+            
+            for page_num in range(pages_to_process):
+                page = pdf.pages[page_num]
+                
+                # Extract text from the page
+                page_text = page.extract_text()
+                
+                if page_text:
+                    # Clean the page text
+                    cleaned_page_text = clean_text(page_text)
+                    extracted_text += cleaned_page_text + " "
+                
+                # Try to extract text from tables if regular text extraction fails
+                if not page_text and page.extract_tables():
+                    tables = page.extract_tables()
+                    for table in tables:
+                        for row in table:
+                            if row:
+                                row_text = " ".join([cell for cell in row if cell])
+                                extracted_text += clean_text(row_text) + " "
+        
+        # Final cleaning of the entire document
+        final_text = clean_text(extracted_text)
+        
+        if not final_text:
+            raise Exception("No text could be extracted from the PDF file")
+            
+        return final_text
+        
+    except Exception as e:
+        raise Exception(f"Error extracting text from PDF: {str(e)}")
+
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    """Split text into chunks for processing."""
+    if not text:
+        return []
+    
+    # Simple word-based chunking (approximating tokens)
+    words = text.split()
+    chunks = []
+    
+    if len(words) <= chunk_size:
+        return [text]
+    
+    i = 0
+    while i < len(words):
+        # Create chunk
+        chunk_words = words[i:i + chunk_size]
+        chunk = " ".join(chunk_words)
+        chunks.append(chunk)
+        
+        # Move to next chunk with overlap
+        i += chunk_size - overlap
+        
+        # Break if we're at the end
+        if i >= len(words):
+            break
+    
+    return chunks
+
+# RAG Retriever class
+class RAGRetriever:
+    """Retrieval-Augmented Generation retriever using FAISS for vector similarity search."""
+    
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", chunk_size: int = 500, top_k: int = 3):
+        self.model_name = model_name
+        self.chunk_size = chunk_size
+        self.top_k = top_k
+        self.chunks = []
+        self.embeddings = None
+        self.index = None
+        
+        # Load the sentence transformer model
+        try:
+            logger.info(f"Loading SentenceTransformer model: {model_name}")
+            self.encoder = SentenceTransformer(model_name)
+            self.embedding_dim = self.encoder.get_sentence_embedding_dimension()
+            logger.info(f"Model loaded successfully. Embedding dimension: {self.embedding_dim}")
+        except Exception as e:
+            logger.error(f"Error loading model {model_name}: {str(e)}")
+            raise Exception(f"Failed to load embedding model: {str(e)}")
+    
+    def process_document(self, document_text: str, overlap: int = 50) -> None:
+        """Process a document by chunking and creating embeddings."""
+        try:
+            logger.info("Starting document processing...")
+            
+            # Chunk the document
+            logger.info(f"Chunking document with chunk_size={self.chunk_size}, overlap={overlap}")
+            self.chunks = chunk_text(document_text, chunk_size=self.chunk_size, overlap=overlap)
+            
+            if not self.chunks:
+                raise Exception("No chunks were created from the document")
+            
+            logger.info(f"Created {len(self.chunks)} chunks")
+            
+            # Create embeddings for all chunks
+            logger.info("Generating embeddings for chunks...")
+            self.embeddings = self.encoder.encode(
+                self.chunks,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            )
+            
+            # Build FAISS index
+            logger.info("Building FAISS index...")
+            self.index = faiss.IndexFlatIP(self.embedding_dim)  # Inner product for normalized embeddings
+            self.index.add(self.embeddings.astype('float32'))
+            
+            logger.info(f"Successfully processed document with {len(self.chunks)} chunks")
+            
+        except Exception as e:
+            logger.error(f"Error processing document: {str(e)}")
+            raise Exception(f"Failed to process document: {str(e)}")
+    
+    def retrieve(self, query: str, top_k: Optional[int] = None) -> List[str]:
+        """Retrieve relevant chunks for a given query."""
+        if self.index is None or not self.chunks:
+            raise Exception("Document must be processed before retrieval")
+        
+        try:
+            # Use instance default if top_k not specified
+            k = top_k if top_k is not None else self.top_k
+            k = min(k, len(self.chunks))  # Don't retrieve more chunks than available
+            
+            logger.info(f"Retrieving top {k} chunks for query: '{query[:50]}...'")
+            
+            # Encode the query
+            query_embedding = self.encoder.encode(
+                [query],
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            )
+            
+            # Search for similar chunks
+            scores, indices = self.index.search(query_embedding.astype('float32'), k)
+            
+            # Get the relevant chunks
+            relevant_chunks = []
+            for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+                if idx < len(self.chunks):
+                    chunk = self.chunks[idx]
+                    relevant_chunks.append(chunk)
+                    logger.debug(f"Retrieved chunk {i+1} (score: {score:.4f}): {chunk[:100]}...")
+            
+            logger.info(f"Successfully retrieved {len(relevant_chunks)} relevant chunks")
+            return relevant_chunks
+            
+        except Exception as e:
+            logger.error(f"Error during retrieval: {str(e)}")
+            raise Exception(f"Failed to retrieve relevant chunks: {str(e)}")
+
+# Document Summarizer class
+class DocumentSummarizer:
+    """Document summarization using pre-trained transformer models."""
+    
+    def __init__(self, model_name: str = "sshleifer/distilbart-cnn-12-6"):
+        self.model_name = model_name
+        self.summarizer = None
+        
+        # Length settings for different summary types
+        self.length_settings = {
+            "short": {"min_length": 30, "max_length": 80},
+            "medium": {"min_length": 80, "max_length": 150},
+            "detailed": {"min_length": 150, "max_length": 300}
+        }
+        
+        try:
+            logger.info(f"Loading summarization model: {model_name}")
+            
+            # Create pipeline
+            self.summarizer = pipeline(
+                "summarization",
+                model=model_name,
+                framework="pt",
+                device=-1  # CPU only for lightweight deployment
+            )
+            
+            logger.info("Summarization model loaded successfully")
+            
+        except Exception as e:
+            logger.error(f"Error loading summarization model: {str(e)}")
+            raise Exception(f"Failed to load summarization model: {str(e)}")
+    
+    def summarize(self, text: str, length: str = "medium", query: Optional[str] = None) -> str:
+        """Summarize text with specified length."""
+        try:
+            if not text.strip():
+                return "No text provided for summarization."
+            
+            # Get length settings
+            length_config = self.length_settings.get(length, self.length_settings["medium"])
+            
+            # Prepare input text
+            input_text = text[:1000]  # Limit input length
+            if query:
+                input_text = f"Question: {query}\nContext: {text[:800]}"
+            
+            # Generate summary
+            result = self.summarizer(
+                input_text,
+                min_length=length_config["min_length"],
+                max_length=length_config["max_length"],
+                do_sample=False,
+                num_beams=4,
+                early_stopping=True
+            )
+            
+            return result[0]['summary_text'].strip()
+            
+        except Exception as e:
+            logger.error(f"Error in summarization: {str(e)}")
+            return f"Error generating summary: {str(e)}"
+    
+    def extract_key_points(self, text: str) -> str:
+        """Extract key points from text."""
+        try:
+            prompt_text = f"Extract the main key points from this text:\n\n{text[:1000]}"
+            
+            summary = self.summarizer(
+                prompt_text,
+                min_length=50,
+                max_length=200,
+                do_sample=False,
+                num_beams=4
+            )
+            
+            key_points_text = summary[0]['summary_text']
+            
+            # Format as bullet points
+            sentences = [s.strip() for s in key_points_text.split('.') if s.strip()]
+            
+            formatted_points = []
+            for i, sentence in enumerate(sentences[:5]):
+                if sentence:
+                    formatted_points.append(f"• {sentence.capitalize()}")
+            
+            if formatted_points:
+                return "\n".join(formatted_points)
+            else:
+                return "• " + key_points_text
+            
+        except Exception as e:
+            logger.error(f"Error extracting key points: {str(e)}")
+            return f"Error extracting key points: {str(e)}"
+
+# Session state initialization
 def initialize_session_state():
     """Initialize session state variables"""
     if 'pdf_processed' not in st.session_state:
@@ -261,7 +536,7 @@ def main():
                         try:
                             # Use entire document for summary
                             summary = st.session_state.summarizer.summarize(
-                                st.session_state.document_text[:4000],  # Limit for model constraints
+                                st.session_state.document_text[:2000],  # Limit for model constraints
                                 length=summary_length
                             )
                             st.success("✅ Full document summary generated!")
@@ -284,7 +559,7 @@ def main():
                     with st.spinner("Extracting key points..."):
                         try:
                             key_points = st.session_state.summarizer.extract_key_points(
-                                st.session_state.document_text[:4000]
+                                st.session_state.document_text[:2000]
                             )
                             st.success("✅ Key points extracted!")
                             st.write(key_points)
@@ -325,7 +600,7 @@ def main():
     st.markdown("""
     <div style="text-align: center; color: #666; padding: 1rem;">
         <p>Built with ❤️ using Streamlit, SentenceTransformers, FAISS, and DistilBART</p>
-        <p>🚀 Optimized for deployment on Hugging Face Spaces & Streamlit Cloud</p>
+        <p>🚀 Optimized for deployment on Streamlit Cloud</p>
     </div>
     """, unsafe_allow_html=True)
 
