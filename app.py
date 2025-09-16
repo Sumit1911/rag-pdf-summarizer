@@ -1,11 +1,27 @@
 import streamlit as st
 import os
+import sys
 import tempfile
 import io
 from datetime import datetime
-from utils.text_extraction import extract_text_from_pdf
-from utils.retrieval import RAGRetriever
-from utils.summarization import DocumentSummarizer
+
+# Add the current directory to Python path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Import utils modules
+try:
+    from utils.text_extraction import extract_text_from_pdf
+    from utils.retrieval import RAGRetriever
+    from utils.summarization import DocumentSummarizer
+except ImportError:
+    # Fallback imports for deployment
+    import utils.text_extraction as text_extraction
+    import utils.retrieval as retrieval
+    import utils.summarization as summarization
+    
+    extract_text_from_pdf = text_extraction.extract_text_from_pdf
+    RAGRetriever = retrieval.RAGRetriever
+    DocumentSummarizer = summarization.DocumentSummarizer
 
 # Page configuration
 st.set_page_config(
